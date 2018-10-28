@@ -27,7 +27,8 @@ import struct
 import sys
 import netifaces
 import select
-import IN
+import pylsl
+from tobiiproglasses_timesync import TimeSynchronization
 
 socket.IPPROTO_IPV6 = 41
 
@@ -44,19 +45,15 @@ class TobiiGlassesController():
 		self.address = address
 		self.iface_name = None
 
-		self.data = {}
-		nd = {'ts': -1}
-		self.data['mems'] = { 'ac': nd, 'gy': nd }
-		self.data['right_eye'] = { 'pc': nd, 'pd': nd, 'gd': nd}
-		self.data['left_eye'] = { 'pc': nd, 'pd': nd, 'gd': nd}
-		self.data['gp'] = nd
-		self.data['gp3'] = nd
-		self.data['pts'] = nd
+		self.gaze_data = {}
+		self.buffered_data =  {'mems': {}, 'gaze': {}, 'triggers' : {}, 'video_sync' : {}, 'msg': {}}
 
 		self.project_id = str(uuid.uuid4())
 		self.project_name = "TobiiProGlasses PyController"
 		self.project_creation_date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 		self.recn = 0
+		
+		self.sync_status = False
 
 		self.KA_DATA_MSG = "{\"type\": \"live.data.unicast\", \"key\": \""+ str(uuid.uuid4()) +"\", \"op\": \"start\"}"
 		self.KA_VIDEO_MSG = "{\"type\": \"live.video.unicast\",\"key\": \""+ str(uuid.uuid4()) +"_video\",  \"op\": \"start\"}"
@@ -77,6 +74,8 @@ class TobiiGlassesController():
 		self.__set_URL__(self.udpport, self.address)
 		if self.__connect__() is False:
 			quit()
+		
+		self.time_sync = TimeSynchronization(self.data_socket, self.base_url)
 
 
 	def __set_URL__(self, udpport, address):
@@ -99,7 +98,7 @@ class TobiiGlassesController():
 		sock = socket.socket(res[0][0], res[0][1], res[0][2])
 		try:
 			if iptype == socket.AF_INET6 and sys.platform == "linux2":
-				sock.setsockopt(socket.SOL_SOCKET, IN.SO_BINDTODEVICE, self.iface_name+'\0')
+				sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, self.iface_name+'\0')
 		except socket.error as e:
 			if e.errno == 1:
 				log.warning("Binding to a network interface is permitted only for root users.")
@@ -111,109 +110,148 @@ class TobiiGlassesController():
 		while self.streaming:
 			sock.sendto(msg, self.peer)
 			time.sleep(self.timeout)
-
-
-	def __grab_data__(self, socket):
-		time.sleep(1)
+	
+	def __grab_data__(self, socket, synchronize):
 		while self.streaming:
-			data, address = socket.recvfrom(1024)
+			data, address = socket.recvfrom(1024)  
 			jdata = json.loads(data)
-			self.__refresh_data__(jdata)
-
-
+			if self.sync_status or not synchronize:   
+				self.__refresh_data__(jdata)
+			else:
+				self.sync_status = self.time_sync.look_for_sync_event(jdata) 
 
 	def __refresh_data__(self, jsondata):
-		try:
-			gy = jsondata['gy']
-			ts = jsondata['ts']
-			if( (self.data['mems']['gy']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data['mems']['gy'] = jsondata
+		while 1: #Needed because in rare occasions the threading makes the function to fail  
+			try:
+				ts_now = pylsl.local_clock()
+				ts = str(jsondata['ts'])
+				s = jsondata['s']
+				if 'eye' in jsondata.keys():
+					eye = jsondata['eye']
+				if 'l' in jsondata.keys():
+					latency = jsondata['l']
+					ts_local = self.__time_et_to_local__(ts, True) if self.sync_status else -1				    
+						
+				if 'gy' in jsondata.keys():
+					gy = jsondata['gy']           
+					self.buffered_data['mems'][ts]['gy'] = [gy]
+					break            			               
+            
+				elif 'ac' in jsondata.keys():
+					ac = jsondata['ac']             
+					self.buffered_data['mems'][ts]['ac'] = [ac]
+					break  
+            
+				elif 'dir' in jsondata.keys():
+					t_dir = jsondata['dir']
+					sig = jsondata['sig']
+					if not s and sig == 1:
+						self.buffered_data['triggers'][ts] = {}
+						self.buffered_data['triggers'][ts]['dir'] = t_dir
+						ts_local = self.__time_et_to_local__(ts) if self.sync_status else -1
+						self.buffered_data['triggers'][ts]['ts_local'] = ts_local   
+					break  
+            
+				elif 'ets' in jsondata.keys():     
+					msg_ets = jsondata['ets']
+					msg_type = jsondata['type']
+					if not s:
+						self.buffered_data['msg'][ts] = {}
+						self.buffered_data['msg'][ts]['ets'] = msg_ets
+						self.buffered_data['msg'][ts]['type'] = msg_type  
+						ts_local = self.__time_et_to_local__(ts) if self.sync_status else -1
+						self.buffered_data['msg'][ts]['ts_local'] = ts_local 
+						self.time_sync.look_for_sync_event(jsondata)
+					break   
+                                                                 
+				elif 'vts' in jsondata.keys():
+					t_dir = jsondata['vts']
+					if not s :
+						self.buffered_data['video_sync'][ts] = {}
+						ts_local = self.__time_et_to_local__(ts) if self.sync_status else -1
+						self.buffered_data['video_sync'][ts]['ts_RU'] = ts  
+						self.buffered_data['video_sync'][ts]['vts'] = str(jsondata['vts'])       
+						self.buffered_data['video_sync'][ts]['ts_local'] = ts_local 
+					break  
+               		
+				elif not ts in self.gaze_data.keys():                   
+					self.gaze_data[ts] = {}
+            
+				if 'pc' in jsondata.keys():
+					pc = jsondata['pc']
+					if not s:             
+						self.gaze_data[ts]['pc_' + eye] = pc
+					else:
+						self.gaze_data[ts]['pc_' + eye] = [-1, -1, -1]
+					break  
+            
+				elif 'pd' in jsondata.keys():
+					pd = jsondata['pd'] 
+					if not s:             
+						self.gaze_data[ts]['pd_' + eye] = pd
+					else:
+						self.gaze_data[ts]['pd_' + eye] = -1
+					break  
+            
+				elif 'gd' in jsondata.keys():
+					gd = jsondata['gd']
+					if not s:             
+						self.gaze_data[ts]['gd_' + eye] = gd
+					else:
+						self.gaze_data[ts]['gd_' + eye] = [-1, -1, -1]
+					break  
+            
+				elif 'gp' in jsondata.keys():
+					gp = jsondata['gp']
+					if not s:             
+						self.gaze_data[ts]['gp'] = gp
+					else:
+						self.gaze_data[ts]['gp'] = [-1, -1]
+					self.gaze_data[ts]['latency'] = latency
+					self.gaze_data[ts]['ts_local'] = ts_local
+					self.gaze_data[ts]['ts_local_received'] = ts_now
+					self.gaze_data[ts]['ts_RU'] = float(ts)      
+					break  
+            
+				elif 'gp3' in jsondata.keys():
+					gp3 = jsondata['gp3'] 
+					if not s:             
+						self.gaze_data[ts]['gp3'] = gp3
+					else:
+						self.gaze_data[ts]['gp3'] = [-1, -1, -1]
+					break  
+    			except:
+				pass
+		try:	
+			if len(self.gaze_data[ts]) == 12:
+				self.buffered_data['gaze'][ts] = self.gaze_data[ts]
+				self.gaze_data = {}
 		except:
 			pass
 
-		try:
-			ac = jsondata['ac']
-			ts = jsondata['ts']
-			if( (self.data['mems']['ac']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data['mems']['ac'] = jsondata
-		except:
-			pass
-
-		try:
-			pc = jsondata['pc']
-			ts = jsondata['ts']
-			eye = jsondata['eye']
-			if( (self.data[eye + '_eye']['pc']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data[eye + '_eye']['pc'] = jsondata
-		except:
-			pass
-
-		try:
-			pd = jsondata['pd']
-			ts = jsondata['ts']
-			eye = jsondata['eye']
-			if( (self.data[eye + '_eye']['pd']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data[eye + '_eye']['pd'] = jsondata
-		except:
-			pass
-
-		try:
-			gd = jsondata['gd']
-			ts = jsondata['ts']
-			eye = jsondata['eye']
-			if( (self.data[eye + '_eye']['gd']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data[eye + '_eye']['gd'] = jsondata
-		except:
-			pass
-
-		try:
-			gp = jsondata['gp']
-			ts = jsondata['ts']
-			if( (self.data['gp']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data['gp'] = jsondata
-
-		except:
-			pass
-
-		try:
-			gp3 = jsondata['gp3']
-			ts = jsondata['ts']
-			if( (self.data['gp3']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data['gp3'] = jsondata
-		except:
-			pass
-
-		try:
-			pts = jsondata['pts']
-			ts = jsondata['ts']
-			if( (self.data['pts']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data['pts'] = jsondata
-		except:
-			pass
-
-		try:
-			pv = jsondata['pv']
-			ts = jsondata['ts']
-			if( (self.data['pv']['ts'] < ts) and (jsondata['s'] == 0) ):
-				self.data['pv'] = jsondata
-		except:
-			pass
-
-
-	def __start_streaming__(self):
+	def __time_et_to_local__(self, ts, check_sync=False):
+		return self.time_sync.ts_to_local(ts, check_sync)
+		
+	def __start_streaming__(self, synchronize):
 		try:
 			self.streaming = True
 			self.td = threading.Timer(0, self.__send_keepalive_msg__, [self.data_socket, self.KA_DATA_MSG])
-			self.tg = threading.Timer(0, self.__grab_data__, [self.data_socket])
+			self.tg = threading.Timer(0, self.__grab_data__, [self.data_socket, synchronize])
 			if self.video_scene:
 				self.tv = threading.Timer(0, self.__send_keepalive_msg__, [self.video_socket, self.KA_VIDEO_MSG])
 				self.tv.start()
 				log.debug("Video streaming started...")
 			self.td.start()
 			self.tg.start()
+			if synchronize:     
+				print "waiting for time synchronization..."
+				self.time_sync.start_synchronization() 
 			log.debug("Data streaming started...")
+			
+			
 		except:
 			self.streaming = False
+			self.time_sync.stop_sync()
 			log.error("An error occurs trying to create the threads for data streaming")
 
 
@@ -295,25 +333,26 @@ class TobiiGlassesController():
 				self.stop_streaming()
 			self.__disconnect__()
 
-	def start_streaming(self):
+	def start_streaming(self, synchronize = True):
 		log.debug("Start streaming ...")
 		try:
-			self.__start_streaming__()
+			self.__start_streaming__(synchronize)
 			log.debug("Data streaming successful started!")
 		except:
 			log.error("An error occurs trying to connect to the Tobii Pro Glasses")
-
 
 	def stop_streaming(self):
 		log.debug("Stop data streaming ...")
 		try:
 			if self.streaming:
 				self.streaming = False
+				self.sync_status = False
+				self.time_sync.stop_sync()
 				self.td.join()
 				self.tg.join()
 				if self.video_scene:
 					self.tv.join()
-			log.debug("Data streaming successful stopped!")
+			log.debug("Data streaming successfully stopped!")
 		except:
 			log.error("An error occurs trying to stop data streaming")
 
@@ -467,15 +506,16 @@ class TobiiGlassesController():
 		self.__post_request__('/api/recordings/' + recording_id + '/pause')
 		return self.wait_for_recording_status(recording_id, ['paused']) == "paused"
 
-	def send_event(self, event_type, event_tag = '', wait_until_status_is_ok = False):
-		data = {'type': event_type, 'tag': event_tag}
+	def send_event(self, event_type, ets = '', event_tag = '', wait_until_status_is_ok = False):
+		data = {'ets': ets, 'type': event_type, 'tag': event_tag}
 		self.__post_request__('/api/events', data)
 		if wait_until_status_is_ok:
 			return self.wait_until_status_is_ok()
 
 	def get_data(self):
-		return self.data
-
+		data = self.buffered_data		
+		self.buffered_data =  {'mems': {}, 'gaze': {}, 'triggers' : {}, 'video_sync': {}, 'msg': {}}
+		return data
 	def get_address(self):
 		return self.address
 
@@ -487,8 +527,8 @@ class TobiiGlassesController():
 
 	def set_video_freq_25(self):
 		data = {'sys_sc_fps': 25}
-		json_data = self.__post_request__('/api/system/conf/', data)
+		self.__post_request__('/api/system/conf/', data)
 
 	def set_video_freq_50(self):
 		data = {'sys_sc_fps': 50}
-		json_data = self.__post_request__('/api/system/conf/', data)
+		self.__post_request__('/api/system/conf/', data)
